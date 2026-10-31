@@ -23,8 +23,15 @@ const (
 // ErrInvalid marks a request that breaks the contract; the gRPC layer maps it to INVALID_ARGUMENT.
 var ErrInvalid = errors.New("invalid argument")
 
+// invalidError is an ErrInvalid whose text is the bare message ("password must be 8-72 bytes (got 5)"):
+// the frontend shows it next to the form field as it is.
+type invalidError struct{ msg string }
+
+func (e invalidError) Error() string        { return e.msg }
+func (e invalidError) Is(target error) bool { return target == ErrInvalid }
+
 func invalid(format string, args ...any) error {
-	return fmt.Errorf("%w: %s", ErrInvalid, fmt.Sprintf(format, args...))
+	return invalidError{msg: fmt.Sprintf(format, args...)}
 }
 
 // NormalizeEmail trims and lower-cases an address. It does not validate it.

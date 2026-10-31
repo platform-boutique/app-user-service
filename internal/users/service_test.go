@@ -103,8 +103,8 @@ func TestRegisterValidation(t *testing.T) {
 		"name":     {Email: "ada@example.com", Password: "correct horse", Name: ""},
 	} {
 		_, err := e.svc.Register(ctx, req)
-		if code(err) != codes.InvalidArgument || !strings.Contains(err.Error(), field) {
-			t.Errorf("%s: %v", field, err)
+		if code(err) != codes.InvalidArgument || !strings.HasPrefix(status.Convert(err).Message(), field+" ") {
+			t.Errorf("%s: %v (the message must start with the field name, nothing else in front)", field, err)
 		}
 	}
 	if len(e.store.users) != 0 {
