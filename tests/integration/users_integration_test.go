@@ -299,9 +299,10 @@ func TestConcurrentDuplicateRegistersGiveExactlyOneAccount(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				addr := email
-				if i%3 == 1 {
+				switch i % 3 {
+				case 1:
 					addr = strings.ToUpper(email)
-				} else if i%3 == 2 {
+				case 2:
 					addr = "  " + email + " "
 				}
 				<-start

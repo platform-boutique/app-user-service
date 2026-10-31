@@ -7,8 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"user-service/internal/users"
-
 	"github.com/sirupsen/logrus"
 )
 
@@ -126,7 +124,6 @@ func TestConfigFromEnv(t *testing.T) {
 	if !cfg.RegisterLimiter.Enabled() {
 		t.Error("register limiter off")
 	}
-	var _ users.Config = cfg
 }
 
 func TestConfigBadSecuritySettingsAreErrors(t *testing.T) {

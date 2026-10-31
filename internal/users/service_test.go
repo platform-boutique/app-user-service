@@ -525,7 +525,7 @@ func TestNothingSecretIsLogged(t *testing.T) {
 	secrets = append(secrets, pw, wrong, reg.Token, lg.Token)
 	for _, tok := range []string{reg.Token, lg.Token} {
 		h := HashToken(tok)
-		secrets = append(secrets, fmt.Sprintf("%x", h), fmt.Sprintf("%X", h), string(h), fmt.Sprint(h))
+		secrets = append(secrets, fmt.Sprintf("%x", h), fmt.Sprintf("%X", h), string(h), fmt.Sprintf("%v", h))
 		secrets = append(secrets, strings.TrimRight(base64Std(h), "="), base64Std(h))
 	}
 	for _, c := range e.store.users {
