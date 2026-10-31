@@ -42,8 +42,11 @@ func hasControl(s string) bool {
 // ValidateEmail normalises (trim, lower-case) and checks a registration address:
 // 3-254 characters, a plain address without display name or angle brackets.
 func ValidateEmail(raw string) (string, error) {
+	if !utf8.ValidString(raw) { // before lower-casing, which would turn bad bytes into U+FFFD
+		return "", invalid("email contains invalid characters")
+	}
 	s := NormalizeEmail(raw)
-	if !utf8.ValidString(s) || hasControl(s) {
+	if hasControl(s) {
 		return "", invalid("email contains invalid characters")
 	}
 	if n := utf8.RuneCountInString(s); n < MinEmailLen || n > MaxEmailLen {

@@ -59,6 +59,8 @@ type Service struct {
 	// dummyHash is compared against when the e-mail is unknown, so that a failed login costs one bcrypt
 	// comparison either way.
 	dummyHash []byte
+	// compare is bcrypt.CompareHashAndPassword; tests replace it to count how often a login pays for one.
+	compare func(hash, password []byte) error
 
 	lastCleanup atomic.Int64 // unix nanos of the last clean-up that was started
 	bg          sync.WaitGroup
@@ -90,6 +92,7 @@ func NewService(store Store, log *logrus.Logger, cfg Config) (*Service, error) {
 	return &Service{
 		store: store, log: log, cost: cfg.BcryptCost, ttl: cfg.SessionTTL,
 		login: cfg.LoginLimiter, register: cfg.RegisterLimiter, now: cfg.Now, dummyHash: dummy,
+		compare: bcrypt.CompareHashAndPassword,
 	}, nil
 }
 
@@ -218,9 +221,9 @@ func (s *Service) Login(ctx context.Context, req *pb.LoginRequest) (*pb.AuthResp
 	// It still costs one comparison (against the dummy) and fails like any other wrong password.
 	matches := false
 	if len(password) <= MaxPasswordLen {
-		matches = bcrypt.CompareHashAndPassword(hash, []byte(password)) == nil
+		matches = s.compare(hash, []byte(password)) == nil
 	} else {
-		_ = bcrypt.CompareHashAndPassword(s.dummyHash, []byte(password[:MaxPasswordLen]))
+		_ = s.compare(s.dummyHash, []byte(password[:MaxPasswordLen]))
 	}
 	if !known || !matches {
 		s.log.Info("[Login] failed attempt")
