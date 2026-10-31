@@ -1,0 +1,12 @@
+.git
+.gitignore
+.dockerignore
+.pre-commit-config.yaml
+Dockerfile
+README.md
+STATUS.md
+tests
+**/*_test.go
+*.out
+.env
+.env.*
