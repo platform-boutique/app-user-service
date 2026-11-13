@@ -15,7 +15,7 @@ spec:
   type: service
   lifecycle: experimental
   owner: group:default/maintainers
-  system: everly
+  system: shop
   providesApis: [user-service-api]
   dependsOn:
     - resource:default/user-db
@@ -28,7 +28,7 @@ metadata:
 spec:
   type: database
   owner: group:default/maintainers
-  system: everly
+  system: shop
 ---
 apiVersion: backstage.io/v1alpha1
 kind: API
@@ -42,6 +42,6 @@ spec:
   type: grpc
   lifecycle: experimental
   owner: group:default/maintainers
-  system: everly
+  system: shop
   definition:
     $text: ./proto/users.proto
