@@ -1,0 +1,26 @@
+site_name: user-service
+site_description: >-
+  A gRPC service for the accounts of the Everly shop: register, log in, resolve a session token, log out.
+repo_url: https://github.com/platform-boutique/app-user-service
+edit_uri: edit/main/docs/
+nav:
+  - Overview: index.md
+  - Architecture: architecture.md
+  - API: api.md
+  - Configuration: configuration.md
+  - Observability: observability.md
+  - Operations: operations.md
+  - Develop & test: development.md
+  - Security notes: security.md
+  - Decisions:
+      - "1. One Postgres per service": adr/0001-one-postgres-per-service.md
+      - "2. Opaque session tokens": adr/0002-opaque-hashed-session-tokens.md
+      - "3. bcrypt and login hardening": adr/0003-bcrypt-and-login-hardening.md
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+plugins:
+  - techdocs-core

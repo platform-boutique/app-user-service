@@ -1,0 +1,47 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: user-service
+  title: user-service
+  description: "A gRPC service for the accounts of the Everly shop: register, log in, resolve a session token, log out."
+  annotations:
+    github.com/project-slug: platform-boutique/app-user-service
+    backstage.io/source-location: url:https://github.com/platform-boutique/app-user-service/tree/main/
+    backstage.io/techdocs-ref: dir:.
+    grafana/dashboard-selector: "tags @> 'user'"
+    grafana/alert-label-selector: "service=user-service"
+  tags: [go, grpc, postgres]
+spec:
+  type: service
+  lifecycle: experimental
+  owner: group:default/maintainers
+  system: everly
+  providesApis: [user-service-api]
+  dependsOn:
+    - resource:default/user-db
+---
+apiVersion: backstage.io/v1alpha1
+kind: Resource
+metadata:
+  name: user-db
+  description: Postgres database owned by user-service (users, sessions).
+spec:
+  type: database
+  owner: group:default/maintainers
+  system: everly
+---
+apiVersion: backstage.io/v1alpha1
+kind: API
+metadata:
+  name: user-service-api
+  description: gRPC interface of user-service (Protocol Buffers).
+  tags: [grpc, protobuf]
+  links:
+    - { url: "https://github.com/platform-boutique/app-user-service/blob/main/proto/users.proto", title: "users.proto on GitHub", icon: code }
+spec:
+  type: grpc
+  lifecycle: experimental
+  owner: group:default/maintainers
+  system: everly
+  definition:
+    $text: ./proto/users.proto
