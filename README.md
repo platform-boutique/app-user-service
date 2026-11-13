@@ -1,163 +1,149 @@
 # user-service
 
-A gRPC service for shop accounts: register, log in, resolve a session token, log out. It owns its own Postgres database and creates the schema with embedded migrations at start-up. Passwords are stored as bcrypt hashes; a session is an opaque random token of which only the SHA-256 is stored. It is demo grade (see [Security notes](#security-notes)): no email verification, no password reset, no roles.
+## Purpose and place in the shop
 
-## At a glance
+A gRPC service for the shop's accounts: register, log in, resolve a session token, log out. It owns its own Postgres database and creates the schema with embedded migrations at start-up. Passwords are stored as bcrypt hashes; a session is an opaque random token of which only the SHA-256 is stored. It is demo grade (see [Known limits](#known-limits) and [`docs/security.md`](docs/security.md)): no email verification, no password reset, no roles. It calls no other service.
+
+Context diagram and the main flow as sequence diagram: [`docs/architecture.md`](docs/architecture.md).
 
 | | |
 |---|---|
-| **Language / runtime** | Go 1.26 (static binary, `CGO_ENABLED=0`) |
-| **Image** | built locally only: `user-service:local` (about 12 MB) |
-| **Protocol / port** | gRPC (HTTP/2, plaintext) on `8086` |
-| **Metrics** | Prometheus `/metrics` on `9090`; pushed over OTLP/gRPC only when an endpoint is set |
-| **Health** | Standard `grpc.health.v1.Health/Check` on `8086`: `NOT_SERVING` until the migrations are done and whenever the database does not answer a ping (checked every 5 s) |
-| **State** | Postgres (`users`, `sessions`), via `DATABASE_URL` |
-| **Depends on** | Its own Postgres (optional: OTLP collector, Pyroscope) |
-| **Called by** | the frontend (accounts pages, header, cart/order identity); nothing else |
-| **gRPC reflection** | Enabled: `grpcurl` works without `-proto` |
+| Language / runtime | Go 1.26 (`go.mod`: `go 1.26.0`, `toolchain go1.26.10`), static binary, `CGO_ENABLED=0` |
+| Image | built locally only: `platform-demo/user-service:local` (`Dockerfile`, user `10001:10001`) |
+| Ports | gRPC `8086` (plaintext), HTTP `9090` (`/metrics`, pprof only with profiling) |
+| Health | `grpc.health.v1.Health/Check` on `8086`, `NOT_SERVING` until the migrations are done and whenever the database does not answer a ping (every 5 s) |
+| State | Postgres (`users`, `sessions`) via `DATABASE_URL` |
+| Depends on | its own Postgres (required); OTLP collector and Pyroscope (optional) |
+| Called by | the frontend (accounts pages, header, cart/order identity; see `local/compose.yaml` and the frontend repo) |
+| gRPC reflection | enabled |
+
+## Status
+
+No CI pipeline, GitHub repository, Helm chart or Backstage registration exists yet; the service is built and run locally only. Status badges are added when the repo has a pipeline.
+
+## Quick start
+
+In the platform-demo workspace (this repo is built from `apps/user-service` by `local/compose.yaml`; the compose commands were not run for this README):
+
+```bash
+local/up.sh                      # builds all images and starts the shop, http://localhost:8080
+SKIP_BUILD=1 local/up.sh         # reuse images
+local/rebuild.sh user-service  # rebuild and recreate only this service
+```
+
+Run the tests (run on 2026-11-13, see Develop):
+
+```bash
+GOTOOLCHAIN=auto go vet ./... && GOTOOLCHAIN=auto go test -race -count=1 ./...
+```
 
 ## API
 
-Package `hipstershop.users`, service `UserService` ([`proto/users.proto`](proto/users.proto), copied verbatim from the slice-5 contract). The package is a sub-package of `hipstershop` on purpose, like `hipstershop.orders`: a client that also compiles `demo.proto` gets no name clashes.
+Package `hipstershop.users`, service `UserService` ([`proto/users.proto`](proto/users.proto)). Full rules, error messages and `grpcurl` examples: [`docs/api.md`](docs/api.md).
 
 | Method | Request | Behaviour | Error codes |
 |---|---|---|---|
-| `Register` | `email`, `password`, `name` | Creates the account and signs it in (same response as `Login`: `user`, `token`, `expires_at`). | `INVALID_ARGUMENT` (message starts with the field name, e.g. `password must be 8-72 bytes (got 5)`), `ALREADY_EXISTS` (`an account with this email already exists`), `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, `INTERNAL` |
-| `Login` | `email`, `password` | Checks the credentials and opens a new session. Several sessions per user can be live at once (one per browser). | `UNAUTHENTICATED` with the ONE message `wrong email or password` for an unknown email, a wrong password and a password that cannot be right (over 72 bytes); `RESOURCE_EXHAUSTED` (`too many attempts, try again in N seconds`); `INVALID_ARGUMENT` only when email or password is empty; `UNAVAILABLE`, `INTERNAL` |
-| `GetSession` | `token` | Returns the `User` of a live session. | `UNAUTHENTICATED` (`invalid or expired session`) for an unknown, malformed, expired or logged-out token; `UNAVAILABLE`, `INTERNAL` |
-| `Logout` | `token` | Revokes that one session. Idempotent: an unknown, malformed, empty or already revoked token is `OK` and changes nothing (a second call does not move `revoked_at`). | `UNAVAILABLE`, `INTERNAL` |
+| `Register` | `email`, `password`, `name` | Creates the account and signs it in (`user`, `token`, `expires_at`) | `INVALID_ARGUMENT`, `ALREADY_EXISTS`, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, `INTERNAL` |
+| `Login` | `email`, `password` | Checks the credentials and opens a new session; several live sessions per user | `UNAUTHENTICATED` (one message `wrong email or password` for every credential failure), `RESOURCE_EXHAUSTED`, `INVALID_ARGUMENT` (empty field), `UNAVAILABLE`, `INTERNAL` |
+| `GetSession` | `token` | Returns the `User` of a live session | `UNAUTHENTICATED` (unknown, malformed, expired or logged-out token), `UNAVAILABLE`, `INTERNAL` |
+| `Logout` | `token` | Revokes that one session; idempotent (unknown or already revoked token is `OK`) | `UNAVAILABLE`, `INTERNAL` |
 
-All handlers answer `UNAVAILABLE` (`database not ready`) until the migrations have run; a database outage later gives `UNAVAILABLE` (`database unavailable`) without SQL details (those are logged); a handler panic becomes `INTERNAL` through a recovery interceptor.
-
-Field rules:
-
-- `email`: trimmed and lower-cased by the service; 3-254 characters; a plain address (`net/mail`, no display name, no `<...>`, no control characters). Unique ignoring case.
-- `password`: 8-72 **bytes** (bcrypt ignores everything after byte 72, so a longer password is refused instead of silently truncated); not trimmed, not changed. At `Login` a password over 72 bytes is just a failed login.
-- `name`: trimmed; 1-100 characters; no control characters.
-- `id` is a UUID v4; `token` is 32 random bytes from `crypto/rand` as base64url without padding (43 characters), returned only by `Register`/`Login`; `expires_at` is login time plus `SESSION_TTL` (default 14 days, fixed, not sliding).
-
-Examples (against the container, see below):
-
-```bash
-grpcurl -plaintext -d '{"email":"ada@example.com","password":"correct horse","name":"Ada"}' localhost:8086 hipstershop.users.UserService/Register
-grpcurl -plaintext -d '{"email":"ADA@example.com","password":"correct horse"}' localhost:8086 hipstershop.users.UserService/Login
-grpcurl -plaintext -d '{"token":"<token>"}' localhost:8086 hipstershop.users.UserService/GetSession
-grpcurl -plaintext -d '{"token":"<token>"}' localhost:8086 hipstershop.users.UserService/Logout
-```
+Field rules: `email` trimmed and lower-cased, 3-254 characters, plain address, unique ignoring case; `password` 8-72 **bytes** (bcrypt limit; longer is refused, not truncated); `name` 1-100 characters; `token` is 32 random bytes as base64url (43 characters), `expires_at` is login time plus `SESSION_TTL`. All handlers answer `UNAVAILABLE` until the migrations have run; a handler panic becomes `INTERNAL`.
 
 ## Configuration
 
-| Variable | Default | Description |
+Every variable read by the code (`grep -rn 'Getenv\|getenv'` over `cmd/` and `internal/`, checked 2026-11-13). All configuration is by environment; there is no config file.
+
+| Variable | Default | Required | Meaning |
+|---|---|---|---|
+| `DATABASE_URL` | none | **yes** | Postgres URL, e.g. `postgres://users:users@user-db:5432/users?sslmode=disable`. The process logs an error and exits 1 if it is unset. A 5 s connect timeout is added unless the URL sets one |
+| `PORT` | `8086` | no | gRPC listen port. The `healthcheck` subcommand reads it too |
+| `METRICS_PORT` | `9090` | no | HTTP port for `/metrics` (and pprof when profiling is on) |
+| `BCRYPT_COST` | `11` | no | bcrypt cost, integer 4-16. Anything else makes the process exit at start-up. Below 10 a warning is logged; the tests use 4 |
+| `SESSION_TTL` | `336h` | no | Session lifetime (Go duration, fixed, not sliding). Invalid or non-positive: the process exits |
+| `LOGIN_RATE_LIMIT` | `5` | no | Login attempts per e-mail address and window, per process. `0` switches it off (warning). An unparsable value keeps the default and is logged |
+| `LOGIN_RATE_WINDOW` | `1m` | no | Window of the login limit (Go duration) |
+| `REGISTER_RATE_LIMIT` | `60` | no | Registrations per window for the whole process (a flood brake, not a per-client limit). `0` switches it off |
+| `REGISTER_RATE_WINDOW` | `1m` | no | Window of the register limit |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (telemetry off) | no | OTLP/**gRPC** endpoint URL with scheme for traces, metrics and logs |
+| `OTEL_SDK_DISABLED` | unset | no | `true` forces telemetry off even with an endpoint |
+| `OTEL_SERVICE_NAME` | `user-service` | no | `service.name` resource attribute |
+| `OTEL_METRIC_EXPORT_INTERVAL` | `15000` | no | Metric push interval: a number of milliseconds, or a Go duration (`15s`). Invalid values fall back to 15 s |
+| `PYROSCOPE_ADDR` | unset (profiling off) | no | Pyroscope server URL. Profiling (push and pprof endpoints) is on only if this is set |
+| `ENABLE_PROFILING` | unset | no | `0` forces profiling off even with `PYROSCOPE_ADDR` |
+| `ENABLE_TRACING` | unset | no | Legacy: `0` forces telemetry off |
+| `COLLECTOR_SERVICE_ADDR` | unset | no | **Legacy, to be removed** (owner decision 2026-11-13): `host:port` of a collector; turns telemetry on without `OTEL_EXPORTER_OTLP_ENDPOINT` |
+| `HOSTNAME` | OS hostname | no | Used as `service.instance.id` (the pod name in Kubernetes) |
+| `OTEL_RESOURCE_ATTRIBUTES` | unset | no | Read by the OTel SDK resource detector (`resource.WithFromEnv`), not by this code directly |
+
+The OTLP exporters of the OpenTelemetry Go SDK also read their own standard `OTEL_EXPORTER_OTLP_*` variables (headers, TLS, timeout); they are not read by this service's code and were not tested. `OTEL_TRACES_SAMPLER` is **not** honoured: the sampler is fixed to always-on (`otlp.go`). `LOG_LEVEL` does not exist: the log level is logrus' default (info).
+
+Start-up: the gRPC server listens at once (health `NOT_SERVING`); a background loop runs the goose migrations (under goose's Postgres advisory lock), retrying every 2 s until the database is reachable. The service hashes one random password at start-up (the dummy for unknown e-mails), so start-up takes about as long as one login (about 0.2 s at cost 11, as measured by the author).
+
+## Observability
+
+What the service emits today (code read 2026-11-13; the compose observability profile was not run for this README):
+
+| Signal | Today | Not there yet (standards section 6) |
 |---|---|---|
-| `DATABASE_URL` | **required** | Postgres URL, e.g. `postgres://users:users@user-db:5432/users?sslmode=disable`. The process exits if it is unset. A 5 s connect timeout is added unless the URL sets one |
-| `PORT` | `8086` | gRPC listen port |
-| `METRICS_PORT` | `9090` | Prometheus (and, with profiling, pprof) HTTP port |
-| `BCRYPT_COST` | `11` | bcrypt cost, integer 4-16. Anything else makes the process exit at start-up (a security setting must not fall back silently). Below 10 a warning is logged; the unit and integration tests use 4 |
-| `SESSION_TTL` | `336h` | Session lifetime (Go duration). Invalid or non-positive: the process exits |
-| `LOGIN_RATE_LIMIT` | `5` | Login attempts per e-mail address and window, per process. `0` switches it off (logged as a warning). An unparsable value keeps the default and is logged |
-| `LOGIN_RATE_WINDOW` | `1m` | Window of the login limit (Go duration) |
-| `REGISTER_RATE_LIMIT` | `60` | Registrations per window for the whole process (a flood brake, not a per-client limit). `0` switches it off |
-| `REGISTER_RATE_WINDOW` | `1m` | Window of the register limit |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset (telemetry off) | OTLP/**gRPC** endpoint for traces, metrics and logs (scheme required). Legacy fallback: `COLLECTOR_SERVICE_ADDR` (`host:port`). Telemetry is on only if one of them is set and non-empty |
-| `OTEL_SDK_DISABLED` | - | `true` forces telemetry off even with an endpoint (the legacy `ENABLE_TRACING=0` does the same) |
-| `OTEL_METRIC_EXPORT_INTERVAL` | `15000` | Milliseconds between metric pushes |
-| `OTEL_SERVICE_NAME` | `user-service` | `service.name` |
-| `PYROSCOPE_ADDR` | unset (profiling off) | Profiling (Pyroscope push **and** the pprof endpoints on `METRICS_PORT`) is on only if this is set and `ENABLE_PROFILING` is not `0` |
-| `ENABLE_PROFILING` | - | `0` forces profiling off |
+| Traces | OTLP/gRPC, only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. A server span per inbound gRPC call (`otelgrpc`), W3C `traceparent` + `baggage` propagation, sampler always-on | spans for Postgres calls |
+| Metrics | Prometheus on `:9090/metrics`: `grpc_server_*` (go-grpc-prometheus with handling-time histogram), Go runtime and process metrics. The same registry is pushed over OTLP when the endpoint is set | `build_info`, DB pool stats, business counters (registrations, logins by outcome, rate-limit rejections) |
+| Logs | JSON on stdout, one object per line: `timestamp` (RFC3339Nano), `severity`, `message` plus fields. Mirrored over OTLP when the endpoint is set. Logs contain user ids, never e-mail addresses, passwords, tokens or hashes (a unit test and an integration test fail if a log line contains any of them). | `trace_id` / `span_id` on the stdout line, `service`, `version`, `LOG_LEVEL` |
+| Profiles | Pyroscope push (CPU, alloc objects/space, inuse objects/space) and pprof on the metrics port, only with `PYROSCOPE_ADDR` | goroutine / mutex / block profiles, tags `version`, `environment` |
 
-Logs are JSON on stdout (logrus, fields `timestamp`, `severity`, `message`). Start-up: the gRPC server listens at once (health `NOT_SERVING`); a background loop runs the goose migrations (under goose's Postgres session advisory lock, so replicas starting together apply each migration once), retrying every 2 s until the database is reachable. SIGTERM/SIGINT: health goes `NOT_SERVING`, `GracefulStop` (10 s cap), then the pool is closed and the process exits 0. The service hashes one random password at start-up (the dummy for unknown e-mails), so start-up takes about as long as one login (about 0.2 s at cost 11).
+Resource attributes today: `service.name`, `service.instance.id` and the SDK's telemetry attributes (plus whatever `OTEL_RESOURCE_ATTRIBUTES` adds). `service.version`, `service.namespace` and `deployment.environment` are not set.
 
-## Security notes
+Example query (not run against a live backend): `sum by (grpc_method, grpc_code) (rate(grpc_server_handled_total{grpc_service="hipstershop.users.UserService"}[5m]))`.
 
-What it does:
+## Data
 
-- **Passwords**: bcrypt at `BCRYPT_COST`, random salt per hash, never logged, never returned. Only the hash is in the database.
-- **Sessions**: the token is 256 random bits; the database stores only `SHA-256(token)` (plus `user_id`, `created_at`, `expires_at`, `revoked_at`), so a leaked table or backup cannot be replayed as cookies. A fast hash is enough because there is nothing to brute-force. `GetSession` checks expiry and revocation in the query; a token that is not 43 base64url characters is refused without a database call.
-- **No user enumeration at login**: an unknown address, a wrong password, a malformed address and a password over 72 bytes all take the same path and give the same code and message. For an unknown address the service compares against a dummy bcrypt hash made at the configured cost, so a failed login costs exactly one bcrypt comparison either way (a unit test counts the comparisons for every failure case; response times were not measured). If `BCRYPT_COST` is changed later, accounts hashed at the old cost still compare at the old cost.
-- **Login rate limit**: sliding window per normalised e-mail address (default 5 per minute), in the memory of one process (same style as the review-service limiter), applied to known and unknown addresses alike. The attempt is counted before the password is checked, so parallel guesses cannot all slip through while bcrypt runs. A success resets the count. Refused attempts are not counted, so a block ends one window after the last counted attempt: someone who keeps failing for an address cannot lock its owner out for good, only for up to one window at a time.
-- **Race-safe registration**: uniqueness is the unique index on `lower(email)`, not a pre-check. A violation maps to `ALREADY_EXISTS`; of N concurrent registrations of one address exactly one wins (tested with 30 goroutines on Postgres, mixed case).
-- **Expired sessions** are deleted opportunistically: a login or registration starts a background `DELETE ... WHERE expires_at <= now`, at most once a minute per process. No cron. Revoked sessions stay until they expire.
-- **Errors** never contain SQL text, the e-mail or the password; logs contain user ids, never e-mail addresses, passwords, tokens, hashes (a unit test and an integration test fail if a log line contains any of them, with a passing control that proves they were looking at real output).
+Postgres, database owned by this service. `users` (`id uuid`, `email`, `name`, `password_hash`, `created_at`) with a unique index on `lower(email)`; `sessions` (`token_hash bytea` primary key, 32 bytes = SHA-256 of the token; `user_id` with `ON DELETE CASCADE`; `created_at`, `expires_at`, `revoked_at`). Check constraints repeat the length limits. The unique index (not a pre-check) makes concurrent registrations of one address race-safe. Expired sessions are deleted opportunistically by a login or registration (at most once a minute per process); revoked sessions stay until they expire.
 
-What it does not do (accepted for the demo, say so before using it for anything real):
+Migrations: [goose](https://github.com/pressly/goose) SQL files in `internal/users/migrations/`, embedded in the binary and applied at start-up under goose's advisory lock, forward-only (`00001_create_users.sql`). No seed data. Demo database in compose: `postgres:17-alpine`, user/password `users` (demo values only, they live in `local/compose.yaml`).
 
-- **No email verification and no password reset.** A lost password means a lost account.
-- **User enumeration on `Register` is accepted**: `ALREADY_EXISTS` tells the caller that an address has an account. The frontend contract needs that message. Only `Login` is hardened.
-- The limiters are **per process**: with N replicas the effective limit is N times higher and a restart resets them. There is no per-client or per-IP limit (the frontend is the only caller and the service sees one address). The register limit is one global bucket, so it protects the CPU and the table from floods but also lets a flood block other registrations for a minute. When 50,000 distinct keys are inside their window a new key is refused (fail closed), which would block logins of addresses not seen before; a flood of 50,000 distinct addresses in one minute is the price.
-- bcrypt work is not capped: many concurrent logins use many cores.
-- No multi-factor authentication, no account deletion, no listing or revoking of other sessions, no change of password or email.
-- Plain gRPC without TLS or authentication of the caller: anyone who can reach the port can call it (in the local stack it is on the internal network only).
-- A failed `Register` after the bcrypt step leaves nothing behind (the account and its first session are one transaction); `Login` after a successful password check and a failed session insert returns an error and the user logs in again.
+## Develop
 
-## Storage
+Requirements: Go 1.26 (`GOTOOLCHAIN=auto` fetches it), Docker for integration tests, [`grpcurl`](https://github.com/fullstorydev/grpcurl) for manual calls. Layout: `cmd/server/` (entry point, config, telemetry, health), `internal/users/` (service, validation, tokens, rate limiter, store, migrations), `proto/`, `tests/integration/`.
 
-`users` (`id uuid`, `email`, `name`, `password_hash`, `created_at`) with a unique index on `lower(email)`, and `sessions` (`token_hash bytea` primary key, 32 bytes; `user_id` with `ON DELETE CASCADE`; `created_at`, `expires_at`, `revoked_at`). Check constraints repeat the length limits. One goose migration, embedded in the binary.
+| Step | Command | Result on 2026-11-13 |
+|---|---|---|
+| Vet + unit tests | `go vet ./... && go test -race -count=1 ./...` | run, passed |
+| Format | `gofmt -l .` | run, no files listed |
+| Lint | `golangci-lint run ./...` (config `.golangci.yaml`, v2 default linters) | run with golangci-lint v2.11.4, 0 issues; also with `--build-tags integration`, 0 issues. CI pins v2.14.0: not run |
+| Integration (Postgres) | see below | not run today (earlier runs by the author are in `docs/development.md`) |
+| Vulnerability / security scan | `govulncheck ./...`, `gosec -exclude-generated ./...` | not run today |
+| Image | `docker build -t platform-demo/user-service:local .` | not run today |
+| Docs | `mkdocs build --strict` (mkdocs 1.6.1 + mkdocs-techdocs-core 1.7.1, Python 3.12 venv made with uv) | run, passed |
 
-## Container image
-
-Multi-stage [`Dockerfile`](Dockerfile) (same as order-service): `golang:1.26-alpine` builder (`--platform=$BUILDPLATFORM`, `GOARCH=$TARGETARCH`), `alpine:3.24` runtime with the single binary at `/app/user-service`.
-
-- **User:** `10001:10001` (numeric, non-root).
-- **HEALTHCHECK:** `/app/user-service healthcheck` calls the gRPC health service on `127.0.0.1:$PORT` and exits 0 only on `SERVING`.
-- **EXPOSE:** `8086`, `9090`. Built locally on amd64 (`docker build -t user-service:local .`); arm64 was not built.
-
-## Not deployed anywhere yet
-
-No Helm chart, pipeline, Backstage entry or GitHub repository exists, and the service is not in the local compose stack yet (the integrator wires `user-db` + `user-service`); it was only built and run on its own.
-
-## Running locally
-
-Requirements: Go 1.26 (`GOTOOLCHAIN=auto` fetches it), Docker, [`grpcurl`](https://github.com/fullstorydev/grpcurl).
-
-What was actually run (all on the final tree):
+Integration tests (build tag `integration`, each test creates and drops its own database):
 
 ```bash
-# unit tests (validation, rate limiter, token/hash helpers, service on an in-memory store, config, no secrets in logs)
-go vet ./... && gofmt -l . && go test -race ./...
-
-# integration tests against a throwaway Postgres (each test creates and drops its own database)
-docker run -d --rm --name usvc-test-$RANDOM --memory 256m -e POSTGRES_USER=users -e POSTGRES_PASSWORD=users \
+docker run -d --rm --name usvc-test-pg --memory 256m -e POSTGRES_USER=users -e POSTGRES_PASSWORD=users \
   -p 127.0.0.1:55436:5432 postgres:17-alpine
 TEST_DATABASE_URL='postgres://users:users@127.0.0.1:55436/postgres?sslmode=disable' \
   go test -race -tags integration ./tests/integration/
-
-# container smoke run: image + a Postgres with its own database and user on one docker network
-docker build -t user-service:local .
-docker network create usvc-smoke-net
-docker run -d --name usvc-smoke-db --memory 256m --network usvc-smoke-net --network-alias user-db -e POSTGRES_DB=users -e POSTGRES_USER=users -e POSTGRES_PASSWORD=users postgres:17-alpine
-docker run -d --name usvc-smoke-svc --memory 128m --network usvc-smoke-net -p 127.0.0.1:58086:8086 \
-  -e DATABASE_URL='postgres://users:users@user-db:5432/users?sslmode=disable' user-service:local
+docker rm -f usvc-test-pg
 ```
 
-Results: `go vet`, `gofmt -l` (empty), `go test -race ./...` and the integration tests with `-race` pass; `golangci-lint run` (default linters, also with `-tags integration`) and `gosec -exclude-generated ./...` report no issues. The integration tests cover: migrations idempotent and six concurrent starts apply exactly one; register -> login -> get session -> logout -> get session `UNAUTHENTICATED`; only the SHA-256 and the bcrypt hash in the tables; duplicate e-mail in several cases (and the constraint itself with a direct insert); 30 concurrent registrations of one address (3 rounds) give exactly one account; wrong password and unknown e-mail give the same code and message; expired and revoked sessions; the rate limit; expired sessions deleted by a login; check constraints; database down gives `UNAVAILABLE` without details; the whole flow over a real gRPC connection; no secrets in the logs.
+Regenerate the Go code after editing the proto: `protoc -I proto --go_out=proto --go_opt=paths=source_relative --go-grpc_out=proto --go-grpc_opt=paths=source_relative proto/users.proto` (protoc 3.21.12, protoc-gen-go 1.36.11, protoc-gen-go-grpc 1.6.1; not run today). Proto changes are additive only, server first.
 
-The container smoke run checked with `grpcurl` (reflection, no `-proto`): service list; register (e-mail lower-cased), duplicate in another case `ALREADY_EXISTS`, short password `INVALID_ARGUMENT`; `GetSession`; wrong password and unknown e-mail both `UNAUTHENTICATED` / `wrong email or password`; login in other case; logout twice `OK`; the logged-out token `UNAUTHENTICATED` while the register token still works; the 6th failed login for one address `RESOURCE_EXHAUSTED`; health `SERVING` and Docker health `healthy`; `/metrics` shows `grpc_server_handled_total` for the four methods; a new container on the same database still logs the user in (`BCRYPT_COST=10`, `SESSION_TTL=1h` honoured); health `NOT_SERVING` and `UNAVAILABLE` after disconnecting the database from the network, `SERVING` and a working login after reconnecting it; uid `10001`; exit code 0 on `docker stop`; no password, token or hash in the container log.
+## Operate
 
-Not run: the OTLP exporters against a real collector and Pyroscope (the code is the order-service code; only the "off by default / forced off" switches are unit-tested), an arm64 build, `govulncheck`, the service inside the compose stack, any load or timing measurement.
+- **Health:** `grpc.health.v1` on the service port, for the empty service name and `hipstershop.users.UserService`. `NOT_SERVING` until the migrations are done, and again whenever the Postgres ping fails (every 5 s); handlers answer `UNAVAILABLE` meanwhile. The image `HEALTHCHECK` runs `/app/user-service healthcheck` (exit 0 only on `SERVING`).
+- **Shutdown:** on SIGTERM/SIGINT health goes `NOT_SERVING`, `GracefulStop` with a 10 s cap (then `Stop`), the metrics server stops (5 s), telemetry is flushed (5 s), the pool is closed, exit 0.
+- **Scaling:** stateless except for Postgres, several replicas are possible (migrations take goose's advisory lock; registration is race-safe through the unique index). The **login and register rate limits are per process**: N replicas allow N times the limit and a restart resets them. bcrypt work is not capped: many concurrent logins use many cores. Multi-replica operation was not run.
+- **Image:** Alpine runtime, user `10001:10001`, `EXPOSE 8086 9090`, about 12 MB when last built.
+- Failure behaviour and runbook: [`docs/operations.md`](docs/operations.md).
 
-Regenerate the Go code after editing the proto: `protoc -I proto --go_out=proto --go_opt=paths=source_relative --go-grpc_out=proto --go-grpc_opt=paths=source_relative proto/users.proto` (protoc 3.21.12, protoc-gen-go 1.36.11, protoc-gen-go-grpc 1.6.1). Proto changes are additive only.
+## Known limits
 
-## Project structure
+- No email verification and no password reset: a lost password means a lost account. No multi-factor authentication, no account deletion, no listing or revoking of other sessions, no change of password or email.
+- `Register` answers `ALREADY_EXISTS` for a known address (user enumeration accepted: the frontend contract needs that message). Only `Login` is hardened.
+- The limiters are per process, there is no per-client or per-IP limit; the register limit is one global bucket; when 50,000 distinct keys are inside their window a new key is refused (fail closed).
+- Plain gRPC without TLS or caller authentication: anyone who can reach the port can call it (in the local stack it is on the internal network only).
+- No spans for database calls; no `trace_id` in logs; no version/commit exposed.
+- Not run: OTLP exporters against a real collector and Pyroscope, arm64 build, `govulncheck`, more than one replica, any load or timing measurement. The legacy `COLLECTOR_SERVICE_ADDR` is still read (to be removed).
 
-```
-├── cmd/server/
-│   ├── main.go            # entrypoint: telemetry, profiling, gRPC server, DB watcher, graceful shutdown
-│   ├── config.go          # BCRYPT_COST, SESSION_TTL, rate limit settings
-│   ├── otlp.go            # OTLP traces/metrics/logs (same as order-service)
-│   └── healthcheck.go     # `user-service healthcheck` for the container HEALTHCHECK
-├── internal/users/
-│   ├── service.go         # gRPC handlers, login failure path, error mapping, session clean-up
-│   ├── validate.go        # email / password / name rules
-│   ├── token.go           # token generation, SHA-256 hash, shape check
-│   ├── ratelimit.go       # sliding-window limiter (as in review-service) + env parsing
-│   ├── store.go           # Postgres store (pgx/v5)
-│   ├── migrate.go         # goose migrations, Setup
-│   └── migrations/        # embedded SQL migrations
-├── proto/                 # users.proto + generated Go
-├── tests/integration/     # tests against a real Postgres (build tag `integration`)
-└── Dockerfile
-```
+## License
 
-## Dependencies
-
-Same pins as order-service, plus `golang.org/x/crypto v0.58.0` (bcrypt; released 2026-10-09) and `github.com/google/uuid v1.6.0` (user ids; was already an indirect dependency).
+To be decided by the owner. No `LICENSE` file exists in this repository yet.
