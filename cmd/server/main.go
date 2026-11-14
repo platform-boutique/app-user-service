@@ -5,26 +5,20 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/http"
-	"net/http/pprof"
 	"os"
 	"os/signal"
 	"runtime/debug"
-	"strings"
 	"syscall"
 	"time"
 
+	"user-service/internal/obs"
 	"user-service/internal/users"
 	pb "user-service/proto"
 
-	"github.com/grafana/pyroscope-go"
 	grpcprom "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/propagation"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health"
@@ -35,20 +29,11 @@ import (
 
 const serviceName = "user-service"
 
-var log *logrus.Logger
+var log = logrus.New()
 
-func init() {
-	log = logrus.New()
-	log.Formatter = &logrus.JSONFormatter{
-		FieldMap: logrus.FieldMap{
-			logrus.FieldKeyTime:  "timestamp",
-			logrus.FieldKeyLevel: "severity",
-			logrus.FieldKeyMsg:   "message",
-		},
-		TimestampFormat: time.RFC3339Nano,
-	}
-	log.Out = os.Stdout
-}
+// drainTimeout is how long in-flight calls get after SIGTERM. With the telemetry flush bound
+// (obs.DefaultShutdownTimeout, 4 s) the process exits within 9 s (CODE-04: 10 s).
+const drainTimeout = 5 * time.Second
 
 func main() {
 	port := "8086"
@@ -61,44 +46,24 @@ func main() {
 		os.Exit(healthcheck(port))
 	}
 
-	// --- Telemetry: traces, metrics and logs pushed over OTLP/gRPC (Alloy → Tempo/Mimir/Loki) ---
-	shutdownTelemetry, err := initTelemetry(context.Background(), serviceName, log)
-	switch {
-	case errors.Is(err, errTelemetryOff):
-		log.Info("telemetry off — set OTEL_EXPORTER_OTLP_ENDPOINT to enable")
-	case err != nil:
-		log.Warnf("telemetry disabled, continuing without it: %v", err)
-	default:
-		log.Info("telemetry enabled (OTLP/gRPC)")
-		defer func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = shutdownTelemetry(ctx)
-		}()
-	}
-
-	// --- Profiling (Pyroscope push + pprof HTTP), only with PYROSCOPE_ADDR set and ENABLE_PROFILING != 0 ---
-	pyroscopeAddr, profiling := profilingConfig()
-	if profiling {
-		initProfiling(pyroscopeAddr)
-	} else {
-		log.Info("profiling off — set PYROSCOPE_ADDR to enable")
-	}
+	// Logger, env contract (OTEL_*, PYROSCOPE_ADDR), OTLP pipelines, Pyroscope, build_info and
+	// /metrics on :9090 live in internal/obs. pprof is served only if PPROF_ADDR is set.
+	o := obs.Start(context.Background(), obs.Options{Service: serviceName, Loggers: []*logrus.Logger{log}})
+	defer o.Recover()
+	defer o.Shutdown()
 
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		log.Error("DATABASE_URL is not set")
-		os.Exit(1)
+		o.Fatal("DATABASE_URL is not set", errors.New("DATABASE_URL is required"))
 	}
 
-	if err := run(port, dsn, profiling); err != nil {
-		log.Errorf("server error: %v", err)
-		os.Exit(1)
+	if err := run(port, dsn); err != nil {
+		o.Fatal("server error", err)
 	}
 	log.Info("stopped")
 }
 
-func run(port, dsn string, profiling bool) error {
+func run(port, dsn string) error {
 	cfg0, err := configFromEnv(os.Getenv, log)
 	if err != nil {
 		return err
@@ -122,18 +87,11 @@ func run(port, dsn string, profiling bool) error {
 		return fmt.Errorf("failed to listen on port %s: %w", port, err)
 	}
 
-	otel.SetTextMapPropagator(
-		propagation.NewCompositeTextMapPropagator(
-			propagation.TraceContext{},
-			propagation.Baggage{},
-		),
-	)
-
 	// gRPC server with OTel tracing + Prometheus metrics interceptors, plus a panic guard
 	srv := grpc.NewServer(
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
-		grpc.ChainUnaryInterceptor(grpcprom.UnaryServerInterceptor, recoverUnary),
-		grpc.StreamInterceptor(grpcprom.StreamServerInterceptor),
+		grpc.ChainUnaryInterceptor(obs.UnaryServerInterceptor(), grpcprom.UnaryServerInterceptor, recoverUnary),
+		grpc.ChainStreamInterceptor(obs.StreamServerInterceptor(), grpcprom.StreamServerInterceptor),
 	)
 
 	store := users.NewPGStore(pool)
@@ -153,34 +111,6 @@ func run(port, dsn string, profiling bool) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
-
-	// --- Metrics (+ pprof only with ENABLE_PROFILING=1) ---
-	metricsPort := "9090"
-	if p := os.Getenv("METRICS_PORT"); p != "" {
-		metricsPort = p
-	}
-	metricsMux := http.NewServeMux()
-	metricsMux.Handle("/metrics", promhttp.Handler())
-	if profiling {
-		metricsMux.HandleFunc("/debug/pprof/", pprof.Index)
-		metricsMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-		metricsMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-		metricsMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-		metricsMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-	}
-	httpSrv := &http.Server{
-		Addr:              ":" + metricsPort,
-		Handler:           metricsMux,
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       5 * time.Second,
-		WriteTimeout:      60 * time.Second, // pprof profile/trace default to 30 s
-	}
-	go func() {
-		log.Infof("metrics endpoint on :%s (pprof: %v)", metricsPort, profiling)
-		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Warnf("metrics server error: %v", err)
-		}
-	}()
 
 	// --- Database: migrate (retrying until the DB is reachable), then watch it ---
 	go watchDatabase(ctx, pool, store, svc, healthSrv)
@@ -203,13 +133,10 @@ func run(port, dsn string, profiling bool) error {
 	go func() { srv.GracefulStop(); close(done) }()
 	select {
 	case <-done:
-	case <-time.After(10 * time.Second):
-		log.Warn("graceful stop timed out, closing remaining connections")
+	case <-time.After(drainTimeout):
+		log.Warnf("graceful stop timed out after %s, closing remaining connections", drainTimeout)
 		srv.Stop()
 	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_ = httpSrv.Shutdown(shutdownCtx)
 	svc.Wait()
 	return nil
 }
@@ -231,7 +158,7 @@ func watchDatabase(ctx context.Context, pool *pgxpool.Pool, store users.Store, s
 		if ctx.Err() != nil {
 			return
 		}
-		log.Warnf("database not ready (attempt %d), retrying in 2s: %v", attempt, err)
+		log.WithError(err).Warnf("database not ready (attempt %d), retrying in 2s", attempt)
 		select {
 		case <-ctx.Done():
 			return
@@ -257,7 +184,7 @@ func watchDatabase(ctx context.Context, pool *pgxpool.Pool, store users.Store, s
 			serving = false
 			svc.SetReady(false)
 			setHealth(h, healthpb.HealthCheckResponse_NOT_SERVING)
-			log.Warnf("health: NOT_SERVING, database unreachable: %v", err)
+			log.WithError(err).Warn("health: NOT_SERVING, database unreachable")
 		}
 	}
 	check()
@@ -277,41 +204,13 @@ func watchDatabase(ctx context.Context, pool *pgxpool.Pool, store users.Store, s
 func recoverUnary(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Errorf("panic in %s: %v\n%s", info.FullMethod, r, debug.Stack())
+			log.WithContext(ctx).WithFields(logrus.Fields{
+				"method": info.FullMethod,
+				"panic":  fmt.Sprint(r),
+				"stack":  string(debug.Stack()),
+			}).Error("recovered from handler panic")
 			err = status.Error(codes.Internal, "internal error")
 		}
 	}()
 	return handler(ctx, req)
-}
-
-// profilingConfig returns the Pyroscope address and whether profiling is on:
-// only when PYROSCOPE_ADDR is set and non-empty and ENABLE_PROFILING is not "0".
-func profilingConfig() (string, bool) {
-	addr := strings.TrimSpace(os.Getenv("PYROSCOPE_ADDR"))
-	if addr == "" || os.Getenv("ENABLE_PROFILING") == "0" {
-		return "", false
-	}
-	return addr, true
-}
-
-// initProfiling starts the Pyroscope push-based profiler.
-func initProfiling(pyroscopeAddr string) {
-
-	_, err := pyroscope.Start(pyroscope.Config{
-		ApplicationName: serviceName,
-		ServerAddress:   pyroscopeAddr,
-		Logger:          pyroscope.StandardLogger,
-		ProfileTypes: []pyroscope.ProfileType{
-			pyroscope.ProfileCPU,
-			pyroscope.ProfileAllocObjects,
-			pyroscope.ProfileAllocSpace,
-			pyroscope.ProfileInuseObjects,
-			pyroscope.ProfileInuseSpace,
-		},
-	})
-	if err != nil {
-		log.Warnf("pyroscope init failed, continuing without it: %v", err)
-		return
-	}
-	log.Info("profiling enabled → pushing to " + pyroscopeAddr)
 }

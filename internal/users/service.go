@@ -114,7 +114,7 @@ func (s *Service) checkReady() error {
 func (s *Service) clock() time.Time { return s.now().UTC().Truncate(time.Microsecond) }
 
 // toStatus maps internal errors to gRPC status codes without leaking SQL details to the caller.
-func (s *Service) toStatus(method string, err error) error {
+func (s *Service) toStatus(ctx context.Context, method string, err error) error {
 	switch {
 	case errors.Is(err, ErrInvalid):
 		return status.Error(codes.InvalidArgument, err.Error())
@@ -123,10 +123,10 @@ func (s *Service) toStatus(method string, err error) error {
 	case errors.Is(err, context.DeadlineExceeded):
 		return status.Error(codes.DeadlineExceeded, "deadline exceeded")
 	case errors.Is(err, ErrUnavailable):
-		s.log.Warnf("[%s] database unavailable: %v", method, err)
+		s.log.WithContext(ctx).WithError(err).Warnf("[%s] database unavailable", method)
 		return status.Error(codes.Unavailable, "database unavailable")
 	default:
-		s.log.Errorf("[%s] error: %v", method, err)
+		s.log.WithContext(ctx).WithError(err).Errorf("[%s] error", method)
 		return status.Error(codes.Internal, "internal error")
 	}
 }
@@ -163,20 +163,20 @@ func (s *Service) Register(ctx context.Context, req *pb.RegisterRequest) (*pb.Au
 	}
 	email, password, name, err := ValidateRegister(req)
 	if err != nil {
-		return nil, s.toStatus("Register", err)
+		return nil, s.toStatus(ctx, "Register", err)
 	}
 	if ok, retry := s.register.Allow("register"); !ok {
-		s.log.Warn("[Register] rate limit reached")
+		s.log.WithContext(ctx).Warn("[Register] rate limit reached")
 		return nil, tooManyAttempts(retry)
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), s.cost)
 	if err != nil {
-		return nil, s.toStatus("Register", err)
+		return nil, s.toStatus(ctx, "Register", err)
 	}
 	now := s.clock()
 	token, ns, err := s.newSession(now)
 	if err != nil {
-		return nil, s.toStatus("Register", err)
+		return nil, s.toStatus(ctx, "Register", err)
 	}
 	u := User{ID: uuid.NewString(), Email: email, Name: name, CreatedAt: now}
 	// No "does it exist" pre-check: the unique index decides, so two concurrent registrations of one
@@ -185,9 +185,9 @@ func (s *Service) Register(ctx context.Context, req *pb.RegisterRequest) (*pb.Au
 		if errors.Is(err, ErrEmailTaken) {
 			return nil, status.Error(codes.AlreadyExists, "an account with this email already exists")
 		}
-		return nil, s.toStatus("Register", err)
+		return nil, s.toStatus(ctx, "Register", err)
 	}
-	s.log.Infof("registered user %s", u.ID)
+	s.log.WithContext(ctx).WithField("user_id", u.ID).Info("registered user")
 	s.maybeCleanup(now)
 	return s.authResponse(u, token, ns), nil
 }
@@ -199,19 +199,19 @@ func (s *Service) Login(ctx context.Context, req *pb.LoginRequest) (*pb.AuthResp
 	}
 	email, password, err := ValidateLogin(req)
 	if err != nil {
-		return nil, s.toStatus("Login", err)
+		return nil, s.toStatus(ctx, "Login", err)
 	}
 	// The attempt is counted before the password is checked (see RateLimiter), for known and unknown
 	// addresses alike.
 	if ok, retry := s.login.Allow(email); !ok {
-		s.log.Warn("[Login] rate limit reached for an address")
+		s.log.WithContext(ctx).Warn("[Login] rate limit reached for an address")
 		return nil, tooManyAttempts(retry)
 	}
 
 	creds, err := s.store.FindByEmail(ctx, email)
 	known := err == nil
 	if err != nil && !errors.Is(err, ErrNotFound) {
-		return nil, s.toStatus("Login", err)
+		return nil, s.toStatus(ctx, "Login", err)
 	}
 	hash := []byte(creds.PasswordHash)
 	if !known {
@@ -226,20 +226,20 @@ func (s *Service) Login(ctx context.Context, req *pb.LoginRequest) (*pb.AuthResp
 		_ = s.compare(s.dummyHash, []byte(password[:MaxPasswordLen]))
 	}
 	if !known || !matches {
-		s.log.Info("[Login] failed attempt")
+		s.log.WithContext(ctx).Info("[Login] failed attempt")
 		return nil, status.Error(codes.Unauthenticated, ErrorMsgLogin)
 	}
 
 	now := s.clock()
 	token, ns, err := s.newSession(now)
 	if err != nil {
-		return nil, s.toStatus("Login", err)
+		return nil, s.toStatus(ctx, "Login", err)
 	}
 	if err := s.store.CreateSession(ctx, creds.ID, ns); err != nil {
-		return nil, s.toStatus("Login", err)
+		return nil, s.toStatus(ctx, "Login", err)
 	}
 	s.login.Reset(email)
-	s.log.Infof("login of user %s", creds.ID)
+	s.log.WithContext(ctx).WithField("user_id", creds.ID).Info("login of user")
 	s.maybeCleanup(now)
 	return s.authResponse(creds.User, token, ns), nil
 }
@@ -260,7 +260,7 @@ func (s *Service) GetSession(ctx context.Context, req *pb.GetSessionRequest) (*p
 		return nil, errSession
 	}
 	if err != nil {
-		return nil, s.toStatus("GetSession", err)
+		return nil, s.toStatus(ctx, "GetSession", err)
 	}
 	return userPB(u), nil
 }
@@ -273,7 +273,7 @@ func (s *Service) Logout(ctx context.Context, req *pb.LogoutRequest) (*pb.Logout
 	token := req.GetToken()
 	if wellFormedToken(token) {
 		if err := s.store.RevokeSession(ctx, HashToken(token), s.clock()); err != nil {
-			return nil, s.toStatus("Logout", err)
+			return nil, s.toStatus(ctx, "Logout", err)
 		}
 	}
 	return &pb.LogoutResponse{}, nil
@@ -294,7 +294,7 @@ func (s *Service) maybeCleanup(now time.Time) {
 		n, err := s.store.DeleteExpired(ctx, now)
 		switch {
 		case err != nil:
-			s.log.Warnf("expired-session clean-up failed: %v", err)
+			s.log.WithError(err).Warn("expired-session clean-up failed")
 		case n > 0:
 			s.log.Infof("deleted %d expired session(s)", n)
 		}
