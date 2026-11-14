@@ -17,6 +17,7 @@ import (
 
 	grpcprom "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"google.golang.org/grpc"
@@ -76,11 +77,19 @@ func run(port, dsn string) error {
 	if cfg.ConnConfig.ConnectTimeout == 0 {
 		cfg.ConnConfig.ConnectTimeout = 5 * time.Second
 	}
+	obs.InstrumentPool(cfg, nil)                                  // database client spans (children of the request span)
 	pool, err := pgxpool.NewWithConfig(context.Background(), cfg) // lazy: does not connect yet
 	if err != nil {
 		return fmt.Errorf("database pool: %w", err)
 	}
 	defer pool.Close()
+	if err := obs.RegisterPoolMetrics(prometheus.DefaultRegisterer, pool); err != nil {
+		log.WithError(err).Warn("database pool metrics not registered")
+	}
+	requestTimeout, badTimeout := obs.RequestTimeoutFromEnv(os.Getenv)
+	if badTimeout != "" {
+		log.Warnf("REQUEST_TIMEOUT=%q is not a duration of at least 100ms (or 0), using %s", badTimeout, requestTimeout)
+	}
 
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
 	if err != nil {
@@ -90,7 +99,7 @@ func run(port, dsn string) error {
 	// gRPC server with OTel tracing + Prometheus metrics interceptors, plus a panic guard
 	srv := grpc.NewServer(
 		grpc.StatsHandler(otelgrpc.NewServerHandler()),
-		grpc.ChainUnaryInterceptor(obs.UnaryServerInterceptor(), grpcprom.UnaryServerInterceptor, recoverUnary),
+		grpc.ChainUnaryInterceptor(obs.UnaryServerInterceptor(), obs.DeadlineUnaryInterceptor(requestTimeout), grpcprom.UnaryServerInterceptor, recoverUnary),
 		grpc.ChainStreamInterceptor(obs.StreamServerInterceptor(), grpcprom.StreamServerInterceptor),
 	)
 
