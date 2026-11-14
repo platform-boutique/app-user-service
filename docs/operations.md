@@ -12,9 +12,9 @@ grpcurl -plaintext localhost:8086 grpc.health.v1.Health/Check
 
 ## Shutdown
 
-SIGTERM or SIGINT: health goes `NOT_SERVING` so probes fail first; `GracefulStop` with a 10 s cap, then `Stop`; the metrics server is shut down (5 s); telemetry is flushed (5 s); the pool is closed; exit 0.
+SIGTERM or SIGINT: health goes `NOT_SERVING` so probes fail first; `GracefulStop` with a 5 s cap, then `Stop`; the pool is closed; telemetry and profiles are flushed (cut off after 4 s) and the metrics listener stops; exit 0. At most 9 s in total, inside the 10 s of CODE-04.
 
-Measured earlier by the author: `docker stop` exit code 0 (image smoke run). Not re-measured with a blackholed OTLP endpoint.
+Measured: with OTLP and Pyroscope pointed at a listener that never answers (and the database unreachable) the binary exited 0 about 4.0 s after SIGTERM. Earlier, by the author: `docker stop` exit code 0 (image smoke run). Not measured again in a container or with a reachable database.
 
 ## Scaling and replicas
 
@@ -32,7 +32,7 @@ Measured earlier by the author: `docker stop` exit code 0 (image smoke run). Not
 | Postgres goes away while running | health `NOT_SERVING` within about 5 s, handlers answer `UNAVAILABLE` (`database unavailable`, no SQL details), `SERVING` again after it returns |
 | Invalid `BCRYPT_COST`, `SESSION_TTL` | process exits at start-up (a security setting must not fall back silently) |
 | Handler panic | turned into `INTERNAL` by a recovery interceptor; the process keeps running |
-| Collector unreachable | telemetry export fails in the background; start-up does not depend on it |
+| Collector unreachable | telemetry export fails in the background (bounded queues, spans and logs are dropped); start-up does not depend on it; the flush on SIGTERM is cut off after 4 s |
 
 ## Runbook
 

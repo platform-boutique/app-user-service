@@ -1,18 +1,28 @@
 # Observability
 
-What the service emits today (code read 2026-11-13; the compose observability profile was not run for this README):
-
-| Signal | Today | Not there yet (standards section 6) |
+| Signal | Implementation | Destination |
 |---|---|---|
-| Traces | OTLP/gRPC, only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set. A server span per inbound gRPC call (`otelgrpc`), W3C `traceparent` + `baggage` propagation, sampler always-on | spans for Postgres calls |
-| Metrics | Prometheus on `:9090/metrics`: `grpc_server_*` (go-grpc-prometheus with handling-time histogram), Go runtime and process metrics. The same registry is pushed over OTLP when the endpoint is set | `build_info`, DB pool stats, business counters (registrations, logins by outcome, rate-limit rejections) |
-| Logs | JSON on stdout, one object per line: `timestamp` (RFC3339Nano), `severity`, `message` plus fields. Mirrored over OTLP when the endpoint is set. Logs contain user ids, never e-mail addresses, passwords, tokens or hashes (a unit test and an integration test fail if a log line contains any of them). | `trace_id` / `span_id` on the stdout line, `service`, `version`, `LOG_LEVEL` |
-| Profiles | Pyroscope push (CPU, alloc objects/space, inuse objects/space) and pprof on the metrics port, only with `PYROSCOPE_ADDR` | goroutine / mutex / block profiles, tags `version`, `environment` |
+| **Traces** | OpenTelemetry (`otelgrpc` handlers), OTLP/gRPC exporter (batch processor, queue bounded at 2048), W3C TraceContext + Baggage propagated to every downstream call. Sampler from `OTEL_TRACES_SAMPLER` (SDK default `parentbased_always_on`) | Alloy `:4317` -> Tempo |
+| **Metrics** | Prometheus default registry: `grpc_server_*` (go-grpc-prometheus with handling-time histogram), Go runtime and process metrics. Served as Prometheus text on `:9090/metrics` (`METRICS_PORT`) and, because the same registry is bridged into OpenTelemetry, also pushed over OTLP every 15 s (metric names identical). Plus `build_info{service,version,commit} 1` | Alloy scrapes `:9090` -> Mimir |
+| **Logs** | `logrus`, one JSON object per line on stdout, plus an OTLP/gRPC hook (`otellogrus`) | stdout -> Alloy -> Loki; OTLP -> Alloy -> Loki |
+| **Profiles** | Pyroscope Go SDK (CPU, alloc/in-use objects and space, goroutines, mutex, block), only with `PYROSCOPE_ADDR`; tags `service_name`, `version`, `environment` | Pyroscope |
 
-Resource attributes today: `service.name`, `service.instance.id` and the SDK's telemetry attributes (plus whatever `OTEL_RESOURCE_ATTRIBUTES` adds). `service.version`, `service.namespace` and `deployment.environment` are not set.
+**Telemetry contract** (the code is `internal/obs`, the same package in every Go service): telemetry is on only if `OTEL_EXPORTER_OTLP_ENDPOINT` is a valid absolute http(s) URL; `OTEL_SDK_DISABLED=true` forces everything off (profiling too); profiling only with `PYROSCOPE_ADDR`. Start never waits for the collector (the exporters connect in the background) and on SIGTERM the flush is cut off after 4 s, so a blackholed collector cannot hold the process (unit-tested with a listener that never answers: start and shutdown both return within the bound).
+
+**Resource attributes** on every signal: `service.name` (`OTEL_SERVICE_NAME`, default `user-service`), `service.version` (`SERVICE_VERSION`, else build info, else `dev`), `service.namespace=everly`, `deployment.environment` (`DEPLOYMENT_ENVIRONMENT`, default `local`), `service.instance.id` (hostname). `OTEL_RESOURCE_ATTRIBUTES` is applied last.
+
+**Log shape** (one shape for all services): `timestamp` (RFC 3339, UTC, milliseconds), `severity` (`debug`, `info`, `warning`, `error`), `message`, `service`, `version`, `trace_id` and `span_id` (hex, only while a valid span is active, never empty or all zeros), `request_id` (when the caller sent one), `error` (string, on errors), plus the call's own fields (for example `order_id`). Level from `LOG_LEVEL`. `trace_id`/`span_id` come from the context of the log call: handlers and clients log with `log.WithContext(ctx)`, the formatter reads the span from it. Calls without a context (startup, background work) have no ids. No card data, tokens or e-mail addresses are logged.
+
+**Startup and version**: the first line is `message: "starting"` with `version`, `commit` and `environment`; `version`/`commit` come from `SERVICE_VERSION`, ldflags `-X <module>/internal/obs.Version=` / `.Commit=`, or the VCS data Go embeds (no Dockerfile change was made: without any of them a container image reports `version: "dev"`, `commit: "unknown"`). Panics are logged as one JSON line (`message: "panic"`, `error`) before the process dies; a startup error is one JSON error line, exit 1.
+
+**pprof** is off. `PPROF_ADDR=127.0.0.1:6060` starts a separate listener; it is never on the metrics port.
+
+**Graceful shutdown** (SIGTERM or SIGINT): health goes `NOT_SERVING`, `GracefulStop` with a 5 s cap (then `Stop`), then the telemetry flush runs, cut off after 4 s, the pool is closed: the process exits within 9 s even when the collector is blackholed. Run against a listener that never answers (OTLP and Pyroscope both pointed at it, database unreachable) the binary exited 0 about 4 s after SIGTERM (smoke run, not part of the unit tests; with a reachable database not re-measured).
+
+**Not there yet** (standards section 6): spans for Postgres calls, DB pool stats and business counters (registrations, logins by outcome, rate-limit rejections); `build_info` is there. Logs contain user ids (`user_id` field), never e-mail addresses, passwords, tokens or hashes (a unit test and an integration test fail if a log line contains any of them; the new log-shape test checks the e-mail address, the password and the token again). Background work (the expired-session clean-up) has no request, so its lines carry no trace ids.
 
 Example query (not run against a live backend): `sum by (grpc_method, grpc_code) (rate(grpc_server_handled_total{grpc_service="hipstershop.users.UserService"}[5m]))`.
 
 ## Switches
 
-Telemetry is off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is set; `OTEL_SDK_DISABLED=true` forces it off; profiling needs `PYROSCOPE_ADDR`. The legacy `COLLECTOR_SERVICE_ADDR` still turns telemetry on in the current code and is to be removed. Details: [configuration](configuration.md).
+Telemetry is off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is a valid absolute http(s) URL; `OTEL_SDK_DISABLED=true` forces it off; profiling needs `PYROSCOPE_ADDR`. The legacy `COLLECTOR_SERVICE_ADDR` and `ENABLE_TRACING` are no longer read. Details: [configuration](configuration.md).

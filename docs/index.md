@@ -9,7 +9,7 @@ A gRPC service for the shop's accounts: register, log in, resolve a session toke
 | | |
 |---|---|
 | Runtime | Go 1.26, static binary, image `platform-demo/user-service:local` (built locally only) |
-| Ports | gRPC `8086`, HTTP `9090` (`/metrics`) |
+| Ports | gRPC `8086`, HTTP `9090` (`/metrics`, scraped by Alloy) |
 | State | its own Postgres (`users`, `sessions`) |
 | Called by | frontend |
 | Status | not deployed anywhere yet; no pipeline, no Helm chart |
