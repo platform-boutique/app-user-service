@@ -16,12 +16,22 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build \
 
 # --- Stage 2: Run ---
 FROM alpine:3.24
+ARG SERVICE_VERSION=dev
+ARG SERVICE_COMMIT=unknown
+
+LABEL org.opencontainers.image.title="user-service" \
+      org.opencontainers.image.source="https://github.com/platform-boutique/app-user-service" \
+      org.opencontainers.image.revision="${SERVICE_COMMIT}" \
+      org.opencontainers.image.version="${SERVICE_VERSION}" \
+      org.opencontainers.image.licenses="Apache-2.0"
 
 WORKDIR /app
 
 COPY --from=builder /user-service .
 
-ENV GOTRACEBACK=single
+ENV GOTRACEBACK=single \
+    SERVICE_VERSION=${SERVICE_VERSION} \
+    SERVICE_COMMIT=${SERVICE_COMMIT}
 
 # numeric non-root user (no entry in /etc/passwd needed); matches the charts' runAsUser
 USER 10001:10001
