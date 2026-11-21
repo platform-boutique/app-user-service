@@ -12,7 +12,7 @@ flowchart LR
     prom[Prometheus scrape :9090] -.-> user
 ```
 
-user-service calls no other service. The caller is taken from the workspace `local/compose.yaml`; it was not re-verified in the frontend's code for this page. The frontend uses the resolved user for the header, the order history (`ClaimOrders` in order-service) and the cart identity.
+user-service calls no other service. The only caller is the frontend (`Register`, `Login`, `GetSession` and `Logout` in `cmd/server/accounts.go`; checked against the `origin/main` code of the callers on 2026-11-21). The frontend uses the resolved user for the header, the order history (`ClaimOrders` in order-service) and the cart identity.
 
 ## Main flow: register, resolve, log out
 
