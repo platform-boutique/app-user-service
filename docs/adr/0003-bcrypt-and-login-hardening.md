@@ -14,3 +14,4 @@ Passwords use bcrypt at `BCRYPT_COST` (default 11, 4-16, invalid values stop the
 
 - Both limiters live in the memory of one process: restart resets them, N replicas allow N times the limit.
 - `Register` still reveals existing addresses (`ALREADY_EXISTS`), because the frontend contract needs it.
+- bcrypt cannot be interrupted, so the 5 s `REQUEST_TIMEOUT` bounds only the database calls around it. Measured on the development host on 2026-11-22 (one hash each): cost 11 0.18 s, cost 14 1.5 s, cost 16 5.9 s. At cost 16 a registration or login can run past the timeout and then fail at its next database call. Documented theoretical case, accepted 2026-11-22: the default is 11, the upper limit 16 stays an operator's choice.

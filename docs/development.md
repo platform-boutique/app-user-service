@@ -2,18 +2,29 @@
 
 Requirements: Go 1.26 (`GOTOOLCHAIN=auto` fetches the toolchain from `go.mod`), Docker for integration tests, `grpcurl`, `golangci-lint` v2.
 
-Commands run on 2026-11-13 for the standards change (host: Go 1.22 with `GOTOOLCHAIN=auto` selecting 1.26.10):
+Final checks of 2026-11-22 (branch `final/user-service`, host: Go 1.22 with `GOTOOLCHAIN=auto` selecting 1.26.11). The same results are in the `## Develop` table of the README.
 
 | Command | Result |
 |---|---|
-| `go vet ./... && go test -race -count=1 ./...` | passed (2 packages with tests) |
-| `golangci-lint run ./...` and `golangci-lint run --build-tags integration ./...` (golangci-lint v2.11.4, `.golangci.yaml`) | 0 issues. The shared pipeline pins v2.14.0: not run |
-| `gofmt -l .` | no files listed |
-| `mkdocs build --strict` (mkdocs 1.6.1, mkdocs-techdocs-core 1.7.1, Python 3.12 venv made with uv) | passed |
+| `gofmt -l .`, `go vet ./...`, `go vet -tags integration ./...` | clean |
+| `go test -race -count=1 ./...` | passed (3 packages with tests; coverage `cmd/server` 17.8%, `internal/users` 73.7%, `internal/obs` 89.6%); `TestGRPCRequestPathLogsCarryTraceIDs` with `-count=50`: passed |
+| `golangci-lint run ./...` and `golangci-lint run --build-tags integration ./...` (golangci-lint v2.14.0 in `golangci/golangci-lint:v2.14.0`, `.golangci.yaml`) | 0 issues both times |
+| Integration tests | 16 integration tests and all unit tests, `go test -race -count=1 -tags integration -v ./tests/integration/ ./...`, throwaway `postgres:17-alpine` (`--memory 256m`): passed |
+| `govulncheck ./...`, `gosec -exclude-generated ./...` | `No vulnerabilities found`; gosec 0 issues (20 files, 2269 lines) |
+| `gitleaks git --redact` over the full history (37 commits scanned) | no leaks found |
+| `docker build --pull --platform linux/amd64 ...`, `trivy image --severity CRITICAL,HIGH --exit-code 1` (0.76.1) | OK, 12.1 MB content (44 MB disk usage); 0 vulnerabilities, exit 0 |
+| whole shop: `local/up.sh` (`SKIP_BUILD=1`), `local/smoke.sh` three times | `SMOKE PASSED`, 87 PASS lines each time; no error log lines of this service afterwards |
+| `mkdocs build --strict` (mkdocs 1.6.1, mkdocs-techdocs-core 1.7.1) and the link check | passed |
+
+The container run (image built with `--build-arg SERVICE_VERSION=final-test`, throwaway `postgres:17-alpine` on a private docker network, `grpcurl` with reflection): Docker health `healthy`, uid:gid `10001:10001`; `Register` (address lower-cased), the same address in another case `ALREADY_EXISTS`, `GetSession` returns the user, a wrong password and an unknown address both `UNAUTHENTICATED` / `wrong email or password`, `Login` with the address in another case OK, `Logout` OK, the logged-out token `UNAUTHENTICATED` while the register token still works, the 6th failed login in a row `RESOURCE_EXHAUSTED`; the `starting` log line carries `version: final-test` and the commit; no log line contains the address, the password or a token; `/metrics` shows `build_info`, `db_pool_connections_max 12` and `grpc_server_handled_total` per method and code; with the database disconnected health went `NOT_SERVING` and `GetSession` answered `UNAVAILABLE` (`database not ready`), after reconnecting `SERVING` again; 0 error log lines; `docker stop` exit code 0 after about 0.4 s.
+
+bcrypt timing (one hash each, development host with 12 cores, a throwaway program using the module's `golang.org/x/crypto`): cost 11 0.18 s, cost 14 1.5 s, cost 16 5.9 s (see ADR 3 for what that means for `REQUEST_TIMEOUT`).
+
+Not run: OTLP exporters against a real collector and Pyroscope, an arm64 build, several replicas against one database, `verify-signals.py`, any load or timing measurement beyond the bcrypt hashes above.
 
 ## What the earlier author ran (recorded, not re-run for this page)
 
-Commands and results below come from the README before the standards change; they were not repeated on 2026-11-13.
+Commands and results below come from the README before the standards change; they were not repeated for this page; the current results are in the table above.
 
 Requirements: Go 1.26 (`GOTOOLCHAIN=auto` fetches it), Docker, [`grpcurl`](https://github.com/fullstorydev/grpcurl).
 
@@ -43,7 +54,7 @@ The container smoke run checked with `grpcurl` (reflection, no `-proto`): servic
 
 Observability step 3 (2026-11-14): `go vet`, `go test ./...` and the integration tests against a throwaway Postgres 17 container pass; `golangci-lint run` (the repo's `.golangci.yaml`, also with `-tags integration`) reports 0 issues; `internal/obs` (the same package as in checkout-service) has the env-matrix, log-shape, resource-attribute and blackholed-collector tests; not repeated: `-race`, `gosec`.
 
-Not run: the OTLP exporters against a real collector and Pyroscope (only the env switches, the bounded start and the bounded shutdown against a listener that never answers are tested), an arm64 build, `govulncheck`, the service inside the compose stack, any load or timing measurement.
+Not run: the OTLP exporters against a real collector and Pyroscope (only the env switches, the bounded start and the bounded shutdown against a listener that never answers are tested), an arm64 build, any load or timing measurement (`govulncheck` and the compose stack were run on 2026-11-22, see above).
 
 Regenerate the Go code after editing the proto: `protoc -I proto --go_out=proto --go_opt=paths=source_relative --go-grpc_out=proto --go-grpc_opt=paths=source_relative proto/users.proto` (protoc 3.21.12, protoc-gen-go 1.36.11, protoc-gen-go-grpc 1.6.1). Proto changes are additive only.
 
