@@ -12,6 +12,6 @@ A gRPC service for the shop's accounts: register, log in, resolve a session toke
 | Ports | gRPC `8086`, HTTP `9090` (`/metrics`, scraped by Alloy) |
 | State | its own Postgres (`users`, `sessions`) |
 | Called by | frontend |
-| Status | not deployed anywhere yet; no pipeline, no Helm chart |
+| Status | shared CI pipeline (merge-only, publishes nothing); no Helm chart; not deployed in any environment yet |
 
 Pages: [architecture](architecture.md), [API](api.md), [configuration](configuration.md), [observability](observability.md), [operations](operations.md), [development](development.md), [security](security.md), [decisions](adr/0001-one-postgres-per-service.md).

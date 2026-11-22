@@ -1,12 +1,12 @@
 # Configuration
 
-Every variable read by the code (`grep -rn 'Getenv\|getenv'` over `cmd/` and `internal/`, checked 2026-11-13). All configuration is by environment; there is no config file.
+Every variable read by the code (`grep -rn 'Getenv\|getenv'` over `cmd/` and `internal/`, checked 2026-11-22). All configuration is by environment; there is no config file.
 
 | Variable | Default | Required | Meaning |
 |---|---|---|---|
 | `DATABASE_URL` | none | **yes** | Postgres URL, e.g. `postgres://users:users@user-db:5432/users?sslmode=disable`. The process logs an error and exits 1 if it is unset. A 5 s connect timeout is added unless the URL sets one |
 | `PORT` | `8086` | no | gRPC listen port. The `healthcheck` subcommand reads it too |
-| `BCRYPT_COST` | `11` | no | bcrypt cost, integer 4-16. Anything else makes the process exit at start-up. Below 10 a warning is logged; the tests use 4 |
+| `BCRYPT_COST` | `11` | no | bcrypt cost, integer 4-16. Anything else makes the process exit at start-up. Below 10 a warning is logged; the tests use 4. Cost 16 takes about 6 s per hash on the development host and bcrypt ignores `REQUEST_TIMEOUT` (see Known limits) |
 | `SESSION_TTL` | `336h` | no | Session lifetime (Go duration, fixed, not sliding). Invalid or non-positive: the process exits |
 | `LOGIN_RATE_LIMIT` | `5` | no | Login attempts per e-mail address and window, per process. `0` switches it off (warning). An unparsable value keeps the default and is logged |
 | `LOGIN_RATE_WINDOW` | `1m` | no | Window of the login limit (Go duration) |
