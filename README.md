@@ -19,7 +19,7 @@ Context diagram and the main flow as sequence diagram: [`docs/architecture.md`](
 
 ## Status
 
-The repository has the shared CI pipeline (`ci / gate`, platform-demo-workflows v3.8.0) and merges to `main` publish nothing (`start-publish: false`, no `publish.yaml`). No Helm chart exists and the service is not deployed in any environment yet; it runs in the local shop only, built from this repository by `local/compose.yaml`.
+The repository has the shared CI pipeline (`ci / gate`, platform-demo-workflows v3.8.0) and a `publish.yaml`: a merge to `main` publishes the signed image to Docker Hub and promotes it in platform-demo-helm (`dev`, then `stage` and `prod` after approval). A Helm chart exists there, but the service is not listed in any environment's `workloads.yaml` yet, so it is not deployed; it runs in the local shop, built from this repository by `local/compose.yaml`.
 
 ## Quick start
 
