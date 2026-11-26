@@ -31,5 +31,3 @@ jobs:
       pull-requests: write
       actions: write # starts Publish
     uses: platform-boutique/platform-demo-workflows/.github/workflows/service-merge.yaml@4e25ad45aa4672355cde027a2a053c956f38576f # v3.8.0
-    with:
-      start-publish: false # no publish.yaml yet (no helm chart): set publish=True in tools/gen-callers.py when it exists
